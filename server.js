@@ -1,168 +1,115 @@
-// Proxy Server untuk mengambil gamepass dari Roblox API
-// Install dependencies: npm install express axios cors dotenv
-// Deploy di Heroku, Railway, atau Render
+// ============================================
+// CLOUDFLARE WORKER: Roblox API Proxy
+// ============================================
+// Deploys to: https://<your-worker-name>.<your-subdomain>.workers.dev
+//
+// Routes:
+//   /friends/v1/users/{userId}/friends/count    → friends.roblox.com
+//   /friends/v1/users/{userId}/followers/count  → friends.roblox.com
+//   /users/v1/users/{userId}                    → users.roblox.com
+//
+// Usage from your Roblox game:
+//   https://<your-worker>.workers.dev/friends/v1/users/123456/friends/count
+// ============================================
 
-const express = require('express');
-const axios = require('axios');
-const cors = require('cors');
-require('dotenv').config();
+// Allowed Roblox API hosts (security: only proxy to these)
+const ALLOWED_HOSTS = {
+  "friends": "https://friends.roblox.com",
+  "users":   "https://users.roblox.com",
+  "groups":  "https://groups.roblox.com",
+  "thumbnails": "https://thumbnails.roblox.com",
+};
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+// Cache TTL per endpoint type (seconds)
+// Cloudflare caches responses at the edge — multiple requests to same URL
+// only hit Roblox once during this window
+const CACHE_TTL = {
+  "friends":    300,   // 5 min - friend/follower counts
+  "users":      900,   // 15 min - user info (verified badge, etc.)
+  "groups":     600,   // 10 min - group memberships
+  "thumbnails": 3600,  // 1 hour - avatar URLs
+};
 
-// Enable CORS untuk Roblox
-app.use(cors());
-app.use(express.json());
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const pathParts = url.pathname.split("/").filter(p => p.length > 0);
 
-// Cache untuk mengurangi API calls
-const cache = new Map();
-const CACHE_DURATION = 60000; // 1 menit
-
-// Endpoint untuk mendapatkan semua gamepass user
-app.get('/api/user/:userId/gamepasses', async (req, res) => {
-    const userId = req.params.userId;
-    const cacheKey = `gamepasses_${userId}`;
-    
-    // Check cache
-    if (cache.has(cacheKey)) {
-        const cached = cache.get(cacheKey);
-        if (Date.now() - cached.timestamp < CACHE_DURATION) {
-            return res.json(cached.data);
-        }
+    // URL format: /{host}/v1/...
+    // Example: /friends/v1/users/123/friends/count
+    if (pathParts.length < 2) {
+      return new Response("Usage: /<host>/v1/...\nAllowed hosts: " +
+        Object.keys(ALLOWED_HOSTS).join(", "), {
+        status: 400,
+        headers: { "Content-Type": "text/plain" }
+      });
     }
-    
+
+    const hostKey = pathParts[0];
+    const targetBase = ALLOWED_HOSTS[hostKey];
+
+    if (!targetBase) {
+      return new Response(`Unknown host: ${hostKey}`, { status: 400 });
+    }
+
+    // Build target URL: remove host prefix, keep rest
+    const remainingPath = "/" + pathParts.slice(1).join("/");
+    const targetUrl = targetBase + remainingPath + url.search;
+
+    // Check edge cache first
+    const cacheKey = new Request(targetUrl, { method: "GET" });
+    const cache = caches.default;
+
+    let response = await cache.match(cacheKey);
+    if (response) {
+      // Cached hit — add header so you can verify in browser/Roblox
+      const headers = new Headers(response.headers);
+      headers.set("X-Proxy-Cache", "HIT");
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    }
+
+    // Cache miss — fetch from Roblox
     try {
-        const gamepasses = [];
-        let cursor = '';
-        let hasMore = true;
-        
-        // Loop untuk mendapatkan semua gamepass (pagination)
-        while (hasMore) {
-            const url = `https://games.roblox.com/v1/games/multiget-place-details?placeIds=&cursor=${cursor}`;
-            const passesUrl = `https://www.roblox.com/users/inventory/list-json?assetTypeId=34&cursor=${cursor}&itemsPerPage=100&pageNumber=1&userId=${userId}`;
-            
-            // Get user's created gamepasses
-            const createdPassesResponse = await axios.get(
-                `https://apis.roblox.com/game-passes/v1/game-passes?creatorId=${userId}&creatorType=User&limit=100&cursor=${cursor}`
-            );
-            
-            if (createdPassesResponse.data && createdPassesResponse.data.data) {
-                for (const pass of createdPassesResponse.data.data) {
-                    gamepasses.push({
-                        id: pass.id,
-                        name: pass.name,
-                        displayName: pass.displayName || pass.name,
-                        price: pass.price || 0,
-                        description: pass.description || '',
-                        iconImageId: pass.iconImageId,
-                        isForSale: pass.isForSale !== false,
-                        sellerId: userId,
-                        sellerName: pass.sellerName || 'Unknown',
-                        productId: pass.productId
-                    });
-                }
-                
-                cursor = createdPassesResponse.data.nextPageCursor || '';
-                hasMore = !!cursor;
-            } else {
-                hasMore = false;
-            }
-        }
-        
-        // Also get gamepasses from user's games
-        const userGamesResponse = await axios.get(
-            `https://games.roblox.com/v2/users/${userId}/games?limit=50&sortOrder=Asc`
-        );
-        
-        if (userGamesResponse.data && userGamesResponse.data.data) {
-            for (const game of userGamesResponse.data.data) {
-                try {
-                    const gamePassesResponse = await axios.get(
-                        `https://games.roblox.com/v1/games/${game.rootPlaceId}/game-passes?limit=100&sortOrder=Asc`
-                    );
-                    
-                    if (gamePassesResponse.data && gamePassesResponse.data.data) {
-                        for (const pass of gamePassesResponse.data.data) {
-                            // Avoid duplicates
-                            if (!gamepasses.find(p => p.id === pass.id)) {
-                                gamepasses.push({
-                                    id: pass.id,
-                                    name: pass.name,
-                                    displayName: pass.displayName || pass.name,
-                                    price: pass.price || 0,
-                                    description: pass.description || '',
-                                    iconImageId: pass.iconImageId,
-                                    isForSale: pass.isForSale !== false,
-                                    sellerId: userId,
-                                    sellerName: pass.sellerName || 'Unknown',
-                                    productId: pass.productId,
-                                    gameId: game.id,
-                                    gameName: game.name
-                                });
-                            }
-                        }
-                    }
-                } catch (err) {
-                    console.error(`Error fetching passes for game ${game.id}:`, err.message);
-                }
-            }
-        }
-        
-        // Sort by price
-        gamepasses.sort((a, b) => a.price - b.price);
-        
-        // Cache the result
-        cache.set(cacheKey, {
-            timestamp: Date.now(),
-            data: { success: true, gamepasses }
-        });
-        
-        res.json({ success: true, gamepasses });
-        
-    } catch (error) {
-        console.error('Error fetching gamepasses:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Failed to fetch gamepasses',
-            message: error.message 
-        });
+      response = await fetch(targetUrl, {
+        method: "GET",
+        headers: {
+          "Accept": "application/json",
+          "User-Agent": "Roblox-Cloudflare-Proxy/1.0",
+        },
+        cf: {
+          // Cloudflare's request-level caching
+          cacheTtl: CACHE_TTL[hostKey] || 300,
+          cacheEverything: true,
+        },
+      });
+
+      // Build new response with cache headers
+      const headers = new Headers(response.headers);
+      headers.set("X-Proxy-Cache", "MISS");
+      headers.set("Cache-Control", `public, max-age=${CACHE_TTL[hostKey] || 300}`);
+      headers.set("Access-Control-Allow-Origin", "*");
+
+      const newResponse = new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+
+      // Store in edge cache for future requests
+      if (response.status === 200) {
+        ctx.waitUntil(cache.put(cacheKey, newResponse.clone()));
+      }
+
+      return newResponse;
+    } catch (err) {
+      return new Response(`Proxy error: ${err.message}`, {
+        status: 502,
+        headers: { "Content-Type": "text/plain" }
+      });
     }
-});
-
-// Endpoint untuk mendapatkan info single gamepass
-app.get('/api/gamepass/:gamepassId', async (req, res) => {
-    const gamepassId = req.params.gamepassId;
-    
-    try {
-        const response = await axios.get(
-            `https://apis.roblox.com/game-passes/v1/game-passes/${gamepassId}/product-info`
-        );
-        
-        res.json({ 
-            success: true, 
-            gamepass: response.data 
-        });
-        
-    } catch (error) {
-        console.error('Error fetching gamepass info:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Failed to fetch gamepass info' 
-        });
-    }
-});
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-    res.json({ status: 'OK', timestamp: Date.now() });
-});
-
-// Clear cache endpoint
-app.post('/api/cache/clear', (req, res) => {
-    cache.clear();
-    res.json({ success: true, message: 'Cache cleared' });
-});
-
-app.listen(PORT, () => {
-    console.log(`Proxy server running on port ${PORT}`);
-});
+  }
+};
